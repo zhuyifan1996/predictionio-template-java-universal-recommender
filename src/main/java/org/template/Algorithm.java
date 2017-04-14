@@ -22,6 +22,7 @@ import org.template.similarity.SimilarityAnalysisJava;
 import scala.Option;
 import scala.Tuple2;
 import scala.concurrent.duration.Duration;
+import org.json4s.JsonDSL;
 
 import java.util.*;
 
@@ -138,6 +139,22 @@ public class Algorithm extends P2LJavaAlgorithm<PreparedData, NullModel, Query, 
       this.actionName = actionName;
       this.itemIDs = itemIDs;
       this.boost = boost;
+    }
+
+    /**
+    Overrides these two functions to use Hashset in getBoostedMetadata()
+     */
+    @Override
+    public boolean equals(Object obj){
+        BoostableCorrelators other = (BoostableCorrelators)obj;
+        return actionName.equals(other.actionName) &&
+                itemIDs.equals(other.itemIDs) &&
+                boost.equals(other.boost) ;
+    }
+
+    @Override
+    public int hashCode(){
+        return actionName.hashCode() + itemIDs.hashCode() + boost.hashCode();
     }
 
     public FilterCorrelators toFilterCorrelators() {
@@ -494,6 +511,124 @@ public class Algorithm extends P2LJavaAlgorithm<PreparedData, NullModel, Query, 
     List<String> backfillFieldNames = this.rankingFieldNames;
     // AlgorithmParams is ap
     return null;
+  }
+
+  /** Get similar items for an item, these are already in the action correlators in ES */
+  private List<BoostableCorrelators> getBiasedSimilarItems(Query query){
+      if (query.getItem() != null){
+          Map<String, Object> m = EsClient.getInstance().getSource(esIndex, esType, query.getItem());
+
+          if (m != null){
+              Float itemEventBias = query.getItemBias() == null ? itemBias : query.getItemBias();
+              Float itemEventsBoost = (itemEventBias > 0 && itemEventBias != 1) ? itemEventBias : null;
+
+              ArrayList<BoostableCorrelators> out = new ArrayList<>();
+              for (String action : modelEventNames){
+                  ArrayList<String> items;
+                  try {
+                      if ( m.containsKey(action) && m.get(action)!=null ) {
+                          items = (ArrayList<String>) m.get(action);
+                      } else {
+                          items = new ArrayList<>();
+                      }
+                  } catch (ClassCastException e){
+                      logger.warn("Bad value in item [${query.item}] corresponding to key:" +
+                              "[$action] that was not a Seq[String] ignored.");
+                      items = new ArrayList<>();
+                  }
+                  List<String> rItems = (items.size()<=maxQueryEvents) ? items : items.subList(0, maxQueryEvents-1);
+                  out.add(new BoostableCorrelators(action, rItems, itemEventsBoost));
+              }
+              return out;
+          } else {
+              return new ArrayList<>();
+          }
+      } else {
+          return new ArrayList<>();
+      }
+  }
+
+  /** get all metadata fields that potentially have boosts (not filters) */
+  private List<BoostableCorrelators> getBoostedMetadata(Query query){
+      ArrayList<Field> paramsBoostedFields = new ArrayList<>();
+      for (Field f : fields){
+          if (f.getBias() < 0f) {paramsBoostedFields.add(f);}
+      }
+
+      ArrayList<Field> queryBoostedFields = new ArrayList<>();
+      if (query.getFields() != null) {
+          for (Field f : query.getFields()){
+              if (f.getBias() >= 0f) {queryBoostedFields.add(f);}
+          }
+      }
+
+      Set<BoostableCorrelators> out = new HashSet<>();
+      for (Field f : queryBoostedFields){
+          out.add(new BoostableCorrelators(f.getName(), f.getValues(), f.getBias()));
+      }
+      for (Field f : paramsBoostedFields){
+          out.add(new BoostableCorrelators(f.getName(), f.getValues(), f.getBias()));
+      }
+      return new ArrayList<>(out);
+  }
+
+  /*
+        val similarItems: Seq[BoostableCorrelators] = if (itemBias >= 0f) {
+            getBiasedSimilarItems(query)
+        } else {
+            Seq.empty
+        }
+
+        val boostedMetadata = getBoostedMetadata(query)
+        val allBoostedCorrelators = recentUserHistory ++ similarItems ++ boostedMetadata
+
+        val shouldFields: Seq[JValue] = allBoostedCorrelators.map {
+            case BoostableCorrelators(actionName, itemIDs, boost) =>
+                render("terms" -> (actionName -> itemIDs) ~ ("boost" -> boost))
+        }
+
+        val shouldScore: JValue = parse(
+                """
+                        |{
+                        |  "constant_score": {
+        |    "filter": {
+        |      "match_all": {}
+        |    },
+        |    "boost": 0
+                    |  }
+        |}
+        |""".stripMargin)
+
+        shouldFields :+ shouldScore
+    }
+   */
+  /** Build should query part */
+  private List<JsonAST.JValue> buildQueryShould(Query query, List<BoostableCorrelators> boostable){
+      // create a list of all boosted query correlators
+      List<BoostableCorrelators> recentUserHistory;
+      if (userBias >= 0f){
+          recentUserHistory = boostable.subList(0, maxQueryEvents - 1);
+      } else {
+          recentUserHistory = new ArrayList<>();
+      }
+
+      List<BoostableCorrelators> similarItems;
+      if (itemBias >= 0f){
+          similarItems = getBiasedSimilarItems(query);
+      } else {
+          similarItems = new ArrayList<>();
+      }
+
+      List<BoostableCorrelators> boostedMetadata = getBoostedMetadata(query);
+      recentUserHistory.addAll(similarItems);
+      recentUserHistory.addAll(boostedMetadata);
+
+      ArrayList<JsonAST.JValue> shouldFields = new ArrayList<>();
+      for (BoostableCorrelators bc: recentUserHistory) {
+          shouldFields.add( render("terms"->) );
+      }
+
+      return null;
   }
 
 }
