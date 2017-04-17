@@ -22,7 +22,11 @@ import org.template.similarity.SimilarityAnalysisJava;
 import scala.Option;
 import scala.Tuple2;
 import scala.concurrent.duration.Duration;
-import org.json4s.JsonDSL;
+
+import com.google.gson.Gson;
+import com.google.gson.JsonObject;
+import com.google.gson.JsonElement;
+import com.google.gson.JsonParser;
 
 import java.util.*;
 
@@ -572,38 +576,8 @@ public class Algorithm extends P2LJavaAlgorithm<PreparedData, NullModel, Query, 
       return new ArrayList<>(out);
   }
 
-  /*
-        val similarItems: Seq[BoostableCorrelators] = if (itemBias >= 0f) {
-            getBiasedSimilarItems(query)
-        } else {
-            Seq.empty
-        }
-
-        val boostedMetadata = getBoostedMetadata(query)
-        val allBoostedCorrelators = recentUserHistory ++ similarItems ++ boostedMetadata
-
-        val shouldFields: Seq[JValue] = allBoostedCorrelators.map {
-            case BoostableCorrelators(actionName, itemIDs, boost) =>
-                render("terms" -> (actionName -> itemIDs) ~ ("boost" -> boost))
-        }
-
-        val shouldScore: JValue = parse(
-                """
-                        |{
-                        |  "constant_score": {
-        |    "filter": {
-        |      "match_all": {}
-        |    },
-        |    "boost": 0
-                    |  }
-        |}
-        |""".stripMargin)
-
-        shouldFields :+ shouldScore
-    }
-   */
   /** Build should query part */
-  private List<JsonAST.JValue> buildQueryShould(Query query, List<BoostableCorrelators> boostable){
+  private List<JsonElement> buildQueryShould(Query query, List<BoostableCorrelators> boostable){
       // create a list of all boosted query correlators
       List<BoostableCorrelators> recentUserHistory;
       if (userBias >= 0f){
@@ -623,12 +597,32 @@ public class Algorithm extends P2LJavaAlgorithm<PreparedData, NullModel, Query, 
       recentUserHistory.addAll(similarItems);
       recentUserHistory.addAll(boostedMetadata);
 
-      ArrayList<JsonAST.JValue> shouldFields = new ArrayList<>();
+      ArrayList<JsonElement> shouldFields = new ArrayList<>();
+      Gson gson = new Gson();
       for (BoostableCorrelators bc: recentUserHistory) {
-          shouldFields.add( render("terms"->) );
+          JsonObject obj = new JsonObject();
+          JsonObject innerObj = new JsonObject();
+          //TODO: does render() in Json4S actually produce a String?
+          innerObj.addProperty(bc.actionName, gson.toJson(bc.itemIDs));
+
+          obj.add("terms", innerObj);
+          obj.addProperty("boost", bc.boost);
+          shouldFields.add( obj );
       }
 
-      return null;
-  }
+      String shouldScore =
+            "{\n"+
+            "   \"constant_score\": {\n" +
+            "  \"filter\": {\n" +
+            "  \"match_all\": {}\n"+
+            "},\n"+
+            "  \"boost\": 0\n"+
+            "  }\n"+
+            "}";
+      shouldFields.add(
+              new JsonParser().parse(shouldScore).getAsJsonObject()
+      );
 
+      return shouldFields;
+  }
 }
