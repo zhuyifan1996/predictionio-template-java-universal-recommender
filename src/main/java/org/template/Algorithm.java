@@ -419,7 +419,7 @@ public class Algorithm extends P2LJavaAlgorithm<PreparedData, NullModel, Query, 
   public PredictedResult predict(NullModel model, Query query) {
     logger.info("Query received, user id: ${query.user}, item id: ${query.item}");
 
-    List<String> queryEventNames = query.getEventNamesOrElse(modelEventNames);
+    queryEventNames = query.getEventNamesOrElse(modelEventNames);
     Tuple2<String, List<Event>> builtQuery = buildQuery(query);
 
     SearchHits searchHits = EsClient.getInstance().search(builtQuery._1(), esIndex);
