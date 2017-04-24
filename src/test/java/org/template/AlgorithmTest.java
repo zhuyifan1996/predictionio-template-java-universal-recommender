@@ -100,7 +100,7 @@ public class AlgorithmTest {
 
     @Test
     public void realTestCalcPop(){
-        
+
     }
 
 }

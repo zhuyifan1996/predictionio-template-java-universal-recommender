@@ -1,6 +1,8 @@
 package org.template;
 
 import com.google.common.base.Optional;
+import com.google.gson.*;
+import com.google.gson.reflect.TypeToken;
 import org.apache.mahout.math.cf.DownsamplableCrossOccurrenceDataset;
 import org.apache.mahout.math.cf.ParOpts;
 import org.apache.mahout.math.indexeddataset.IndexedDataset;
@@ -14,6 +16,7 @@ import org.apache.spark.api.java.JavaPairRDD;
 import org.apache.spark.api.java.function.PairFunction;
 import org.elasticsearch.search.SearchHit;
 import org.elasticsearch.search.SearchHits;
+import org.joda.time.DateTime;
 import org.json4s.JsonAST;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -410,10 +413,25 @@ public class Algorithm extends P2LJavaAlgorithm<PreparedData, NullModel, Query, 
   }
 
   public NullModel calcPop(SparkContext sc, PreparedData data) {
-    throw new RuntimeException("Not yet implemented; waiting on engine" +
-        " team to modify PreparedData");
+    JavaPairRDD<String, Map<String, JsonAST.JValue>> fieldsRDD = data.getFieldsRDD();
+    JavaPairRDD<String, Map<String, JsonAST.JValue>> ranksRDD = getRanksRDD(fieldsRDD, sc);
 
+    JavaPairRDD<String, Map<String, JsonAST.JValue>> currentMetadataRDD = EsClient.getInstance().getRDD(esIndex, esType, sc);
+    JavaPairRDD<String, Map<String, JsonAST.JValue>> propertiesRDD = currentMetadataRDD.fullOuterJoin(ranksRDD).mapToPair(new CalcAllFunction());
+
+    // singleton list for propertiesRdd
+    ArrayList<JavaPairRDD<String, Map<String, JsonAST.JValue>>> pList = new ArrayList<>();
+    pList.add(fieldsRDD.cache());
+    pList.add(propertiesRDD.cache());
+    new URModel(
+        new ArrayList<Tuple2<String, IndexedDataset>>(),
+        pList,
+        getRankingMapping(),
+        false,
+        sc).save(dateNames, esIndex, esType);
+    return new NullModel();
   }
+
 
   @Override
   public PredictedResult predict(NullModel model, Query query) {
@@ -425,7 +443,6 @@ public class Algorithm extends P2LJavaAlgorithm<PreparedData, NullModel, Query, 
     SearchHits searchHits = EsClient.getInstance().search(builtQuery._1(), esIndex);
     Boolean withRanks = query.getRankingsOrElse(false);
     List<ItemScore> recs = new ArrayList<>();
-
 
     if (searchHits.totalHits() > 0) {
       SearchHit[] hits = searchHits.getHits();
@@ -449,14 +466,10 @@ public class Algorithm extends P2LJavaAlgorithm<PreparedData, NullModel, Query, 
       }
       logger.info("Results: ${searchHits.getHits.length} retrieved of a possible ${searchHits.totalHits()}");
       return new PredictedResult(recs);
-    }
-
-    // No search hits.. case "_" in scala version
-    else {
+    } else {
       logger.info("No results for query " + query.toString());
       return new PredictedResult(null);
     }
-
   }
 
   /**
@@ -511,69 +524,307 @@ public class Algorithm extends P2LJavaAlgorithm<PreparedData, NullModel, Query, 
     return new Tuple2<>(boostableCorrelators, recentEvents);
   }
 
+  private List<JsonElement> buildQueryMust(Query query, List<BoostableCorrelators> boostable) {
+
+    List<FilterCorrelators> recentUserHistoryFilter = new ArrayList<>();
+    if (userBias < 0.0f) {
+      recentUserHistoryFilter = boostable.stream().map(
+          correlator -> {
+            return correlator.toFilterCorrelators();
+          }
+      ).collect(toList()).subList(0, maxQueryEvents - 1);
+    }
+
+    List<FilterCorrelators> similarItemsFilter = new ArrayList<>();
+    if (userBias < 0.0f) {
+      similarItemsFilter = getBiasedSimilarItems(query).stream()
+          .map(correlator -> correlator.toFilterCorrelators())
+          .collect(toList())
+          .subList(0, maxQueryEvents - 1);
+    }
+
+    List<FilterCorrelators> filteringMetadata = getFilteringMetadata(query);
+    List<JsonElement> filteringDateRange = getFilteringDateRange(query);
+
+    List<FilterCorrelators> allFilteringCorrelators = new ArrayList<>(recentUserHistoryFilter);
+    allFilteringCorrelators.addAll(similarItemsFilter);
+    allFilteringCorrelators.addAll(filteringMetadata);
+
+    GsonBuilder builder = new GsonBuilder();
+    Gson gson = builder.create();
+    List<JsonElement> mustFields = allFilteringCorrelators.stream().map(
+        filterCorrelator -> {
+          String actionName = filterCorrelator.actionName;
+          List<String> itemIDs = filterCorrelator.itemIDs;
+
+          JsonObject obj = new JsonObject();
+          JsonObject innerObj = new JsonObject();
+
+          JsonElement itemIDsObj = gson.toJsonTree(itemIDs, new TypeToken<List<String>>() {
+          }.getType());
+
+          innerObj.add(actionName, itemIDsObj);
+          obj.add("terms", innerObj);
+          obj.addProperty("boost", 0);
+
+          return obj;
+        }
+    ).collect(toList());
+
+    mustFields.addAll(filteringDateRange);
+    return mustFields;
+  }
+
+  private List<FilterCorrelators> getFilteringMetadata(Query query) {
+    List<Field> paramsFilterFields = this.fields.stream()
+        .filter(field -> field.getBias() >= 0.0f)
+        .collect(toList());
+    List<Field> queryFilterFields = query.getFields().stream()
+        .filter(field -> field.getBias() < 0.0f)
+        .collect(toList());
+
+    paramsFilterFields.addAll(queryFilterFields);
+    List<FilterCorrelators> toReturn = paramsFilterFields.stream()
+        .map(field -> new FilterCorrelators(field.getName(), field.getValues()))
+        .distinct()
+        .collect(toList());
+    return toReturn;
+  }
+
+  private List<JsonElement> getFilteringDateRange(Query query) {
+    DateTime currentDateDate = query.getCurrentDate();
+    if (currentDateDate == null)
+      currentDateDate = DateTime.now().toDateTimeISO();
+    String currentDate = currentDateDate.toString();
+
+    List<JsonElement> json = new ArrayList<>();
+    DateRange dr = query.getDateRange();
+
+    if (dr != null && (dr.getAfter() != null || dr.getBefore() != null)) {
+      String name = dr.getName();
+
+      DateTime beforeDate = dr.getBefore();
+      DateTime afterDate = dr.getAfter();
+
+      String before = beforeDate == null ? "" : beforeDate.toString();
+      String after = afterDate == null ? "" : afterDate.toString();
+
+      StringBuilder rangeStart = new StringBuilder()
+          .append("\n{\n  \"constant_score\": {\n    \"filter\": {\n")
+          .append("      \"range\": {\n        \"")
+          .append(name)
+          .append("\": {\n");
+
+      String rangeAfter = new StringBuilder()
+          .append("\n          \"gt\": \"")
+          .append(after)
+          .append("\"\n")
+          .toString();
+
+      String rangeBefore = new StringBuilder()
+          .append("\n          \"lt\": \"")
+          .append(before)
+          .append("\"\n")
+          .toString();
+
+      String rangeEnd = new StringBuilder()
+          .append("\n        }\n      }\n    },\n    \"boost\": 0\n  }\n}\n")
+          .toString();
+
+      StringBuilder range = rangeStart;
+      if (!after.isEmpty()) {
+        range.append(rangeAfter);
+
+        if (!before.isEmpty())
+          range.append(",");
+      }
+      if (!before.isEmpty())
+        range.append(rangeBefore);
+
+      range.append(rangeEnd);
+      JsonElement el = new JsonParser().parse(range.toString());
+      json.add(el);
+    } else if (ap.getAvailableDateName() != null && ap.getExpireDateName() != null) {
+      String availableDate = ap.getAvailableDateName();
+      String expireDate = ap.getExpireDateName();
+
+      String available = new StringBuilder()
+          .append("\n{\n  \"constant_score\": {\n    \"filter\": {\n")
+          .append("      \"range\": {\n        \"")
+          .append(availableDate)
+          .append("\": {\n          \"lte\": \"")
+          .append(currentDate)
+          .append("\"\n        }\n      }\n    },\n    \"boost\": 0\n  }\n}\n")
+          .toString();
+
+      String expire = new StringBuilder()
+          .append("\n{\n  \"constant_score\": {\n    \"filter\": {\n")
+          .append("      \"range\": {\n        \"")
+          .append(expireDate)
+          .append("\": {\n          \"gt\": \"")
+          .append(currentDate)
+          .append("\"\n        }\n      }\n    },\n    \"boost\": 0\n  }\n}\n")
+          .toString();
+
+      JsonElement avEl = new JsonParser().parse(available);
+      JsonElement exEl = new JsonParser().parse(expire);
+      json.add(avEl);
+      json.add(exEl);
+    } else {
+      logger.info("\nMisconfigured date information, either your engine.json date settings " +
+          "or your query's dateRange is incorrect.\n" +
+          "Ignoring date information for this query.");
+    }
+
+    return json;
+  }
+
+  /**
+   * Query strucutre :
+   * {
+   * "size": 0,
+   * "query": {
+   * "bool":{
+   * "should": [{}, {}],
+   * "must": [{}, {}],
+   * "must_not": [{}, {}],
+   * "minimum_should_match": 1
+   * }
+   * },
+   * "sort": [{}, {}]
+   * }
+   *
+   * @param query
+   * @return query string , List of events
+   */
+
   private Tuple2<String, List<Event>> buildQuery(Query query) {
-    List<String> backfillFieldNames = this.rankingFieldNames;
+    List<String> backfillFieldNames = this.rankingFieldNames; // created during the initialization
     // AlgorithmParams is ap
+
+    try {
+      Tuple2<List<BoostableCorrelators>, List<Event>> boostableEvents = getBiasedRecentUserActions(query);
+      int numRecs = query.getNumOrElse(DefaultURAlgorithmParams.DefaultNum);
+      List<JsonElement> should = buildQueryShould(query, boostableEvents._1());
+      List<JsonElement> must = buildQueryMust(query, boostableEvents._1());
+      List<JsonElement> mustNot = buildQueryMustNot(query, boostableEvents._2());
+      List<JsonElement> sort = buildQuerySort();
+
+      JsonObject jsonQuery = new JsonObject(); // Outer most
+      JsonObject innerObj = new JsonObject();
+      JsonObject innerMostObject = new JsonObject();
+
+      // add "size" to outer query
+      jsonQuery.addProperty("size", numRecs);
+
+      // add "query" to outer query
+      jsonQuery.add("query", innerObj);
+      innerObj.add("bool", innerMostObject);
+
+
+      JsonArray shouldJsonArray = new JsonArray();
+      if (should != null) should.forEach(shouldJsonArray::add);
+      innerMostObject.add("should", shouldJsonArray);
+
+      JsonArray mustJsonArray = new JsonArray();
+      if (must != null) must.forEach(mustJsonArray::add);
+      innerMostObject.add("must", mustJsonArray);
+
+      JsonArray mustNotJsonArray = new JsonArray();
+      if (mustNot != null) mustNot.forEach(mustNotJsonArray::add);
+      innerMostObject.add("must_not", mustNotJsonArray);
+
+      innerMostObject.addProperty("minimum_should_match", 1);
+
+      // add "sort" to outer query
+      JsonArray sortJsonArray = new JsonArray();
+      if (sort != null) sort.forEach(sortJsonArray::add);
+      jsonQuery.add("sort", sortJsonArray);
+
+      String queryStr = jsonQuery.toString();
+      logger.info("Query : " + queryStr);
+
+      return new Tuple2<>(queryStr, boostableEvents._2());
+    } catch (IllegalArgumentException ex) {
+      logger.debug("IllegalArgumentException" + ex.getMessage());
+      return new Tuple2<>("", new ArrayList<>());
+    }
+
+  }
+
+  /**
+   * Get similar items for an item, these are already in the action correlators in ES
+   */
+  private List<BoostableCorrelators> getBiasedSimilarItems(Query query) {
+    if (query.getItem() != null) {
+      Map<String, Object> m = EsClient.getInstance().getSource(esIndex, esType, query.getItem());
+
+      if (m != null) {
+        Float itemEventBias = query.getItemBias() == null ? itemBias : query.getItemBias();
+        Float itemEventsBoost = (itemEventBias > 0 && itemEventBias != 1) ? itemEventBias : null;
+
+        ArrayList<BoostableCorrelators> out = new ArrayList<>();
+        for (String action : modelEventNames) {
+          ArrayList<String> items;
+          try {
+            if (m.containsKey(action) && m.get(action) != null) {
+              items = (ArrayList<String>) m.get(action);
+            } else {
+              items = new ArrayList<>();
+            }
+          } catch (ClassCastException e) {
+            logger.warn("Bad value in item [${query.item}] corresponding to key:" +
+                "[$action] that was not a Seq[String] ignored.");
+            items = new ArrayList<>();
+          }
+          List<String> rItems = (items.size() <= maxQueryEvents) ? items : items.subList(0, maxQueryEvents - 1);
+          out.add(new BoostableCorrelators(action, rItems, itemEventsBoost));
+        }
+        return out;
+      } else {
+        return new ArrayList<>();
+      }
+    } else {
+      return new ArrayList<>();
+    }
+  }
+
+  /**
+   * get all metadata fields that potentially have boosts (not filters)
+   */
+  private List<BoostableCorrelators> getBoostedMetadata(Query query) {
+    ArrayList<Field> paramsBoostedFields = new ArrayList<>();
+    for (Field f : fields) {
+      if (f.getBias() < 0f) {
+        paramsBoostedFields.add(f);
+      }
+    }
+
+    ArrayList<Field> queryBoostedFields = new ArrayList<>();
+    if (query.getFields() != null) {
+      for (Field f : query.getFields()) {
+        if (f.getBias() >= 0f) {
+          queryBoostedFields.add(f);
+        }
+      }
+    }
+
+    Set<BoostableCorrelators> out = new HashSet<>();
+    for (Field f : queryBoostedFields) {
+      out.add(new BoostableCorrelators(f.getName(), f.getValues(), f.getBias()));
+    }
+    for (Field f : paramsBoostedFields) {
+      out.add(new BoostableCorrelators(f.getName(), f.getValues(), f.getBias()));
+    }
+    return new ArrayList<>(out);
+  }
+
+  private List<JsonElement> buildQueryMustNot(Query query, List<Event> boostable) {
     return null;
   }
 
-  /** Get similar items for an item, these are already in the action correlators in ES */
-  private List<BoostableCorrelators> getBiasedSimilarItems(Query query){
-      if (query.getItem() != null){
-          Map<String, Object> m = EsClient.getInstance().getSource(esIndex, esType, query.getItem());
-
-          if (m != null){
-              Float itemEventBias = query.getItemBias() == null ? itemBias : query.getItemBias();
-              Float itemEventsBoost = (itemEventBias > 0 && itemEventBias != 1) ? itemEventBias : null;
-
-              ArrayList<BoostableCorrelators> out = new ArrayList<>();
-              for (String action : modelEventNames){
-                  ArrayList<String> items;
-                  try {
-                      if ( m.containsKey(action) && m.get(action)!=null ) {
-                          items = (ArrayList<String>) m.get(action);
-                      } else {
-                          items = new ArrayList<>();
-                      }
-                  } catch (ClassCastException e){
-                      logger.warn("Bad value in item [${query.item}] corresponding to key:" +
-                              "[$action] that was not a Seq[String] ignored.");
-                      items = new ArrayList<>();
-                  }
-                  List<String> rItems = (items.size()<=maxQueryEvents) ? items : items.subList(0, maxQueryEvents-1);
-                  out.add(new BoostableCorrelators(action, rItems, itemEventsBoost));
-              }
-              return out;
-          } else {
-              return new ArrayList<>();
-          }
-      } else {
-          return new ArrayList<>();
-      }
-  }
-
-  /** get all metadata fields that potentially have boosts (not filters) */
-  private List<BoostableCorrelators> getBoostedMetadata(Query query){
-      ArrayList<Field> paramsBoostedFields = new ArrayList<>();
-      for (Field f : fields){
-          if (f.getBias() < 0f) {paramsBoostedFields.add(f);}
-      }
-
-      ArrayList<Field> queryBoostedFields = new ArrayList<>();
-      if (query.getFields() != null) {
-          for (Field f : query.getFields()){
-              if (f.getBias() >= 0f) {queryBoostedFields.add(f);}
-          }
-      }
-
-      Set<BoostableCorrelators> out = new HashSet<>();
-      for (Field f : queryBoostedFields){
-          out.add(new BoostableCorrelators(f.getName(), f.getValues(), f.getBias()));
-      }
-      for (Field f : paramsBoostedFields){
-          out.add(new BoostableCorrelators(f.getName(), f.getValues(), f.getBias()));
-      }
-      return new ArrayList<>(out);
+  private List<JsonElement> buildQuerySort() {
+    return null;
   }
 
   /** Build should query part */
