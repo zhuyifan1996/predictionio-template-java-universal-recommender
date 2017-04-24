@@ -133,7 +133,7 @@ public class Algorithm extends P2LJavaAlgorithm<PreparedData, NullModel, Query, 
     }
   }
 
-  private static class BoostableCorrelators {
+  protected static class BoostableCorrelators {
     public final String actionName;
     public final List<String> itemIDs; // itemIDs
     public final Float boost;
@@ -577,7 +577,7 @@ public class Algorithm extends P2LJavaAlgorithm<PreparedData, NullModel, Query, 
   }
 
   /** Build should query part */
-  private List<JsonElement> buildQueryShould(Query query, List<BoostableCorrelators> boostable){
+  protected List<JsonElement> buildQueryShould(Query query, List<BoostableCorrelators> boostable){
       // create a list of all boosted query correlators
       List<BoostableCorrelators> recentUserHistory;
       if (userBias >= 0f){
