@@ -88,15 +88,15 @@ public class AlgorithmTest {
         System.out.println(new Gson().toJson(testL));
     }
 
-    @Test
-    public void testBuildQueryShould1(){
-        System.out.println("[testBuildQueryShould1]");
-        ArrayList<Algorithm.BoostableCorrelators> boostables = new ArrayList<>();
-        Query query = new Query("user1", 1f, "item1",1f,
-                new ArrayList<Field>(), null, null, new ArrayList<String>(),
-                false, 20, new ArrayList<String>(), false);
-        System.out.println(algorithm.buildQueryShould(query, boostables));
-    }
+//    @Test
+//    public void testBuildQueryShould1(){
+//        System.out.println("[testBuildQueryShould1]");
+//        ArrayList<Algorithm.BoostableCorrelators> boostables = new ArrayList<>();
+//        Query query = new Query("user1", 1f, "item1",1f,
+//                new ArrayList<Field>(), null, null, new ArrayList<String>(),
+//                false, 20, new ArrayList<String>(), false);
+//        System.out.println(algorithm.buildQueryShould(query, boostables));
+//    }
 
     @Test
     public void realTestCalcPop(){
